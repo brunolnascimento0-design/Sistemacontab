@@ -176,7 +176,7 @@ else:
         st.metric("Despesas", f"R$ {despesas:,.2f}")
         st.metric("Resultado Líquido", f"R$ {resultado:,.2f}")
 
-       elif menu == "🏛️ Fiscal":
+    elif menu == "🏛️ Fiscal":
         st.header("Apuração Fiscal (Faturamento 12 Meses)")
         df_fat = pd.DataFrame({
             'Mês': ['09/25', '10/25', '11/25', '12/25', '01/26', '02/26'],
