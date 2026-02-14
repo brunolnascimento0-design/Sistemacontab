@@ -4,7 +4,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import io
 import contextlib
-from datetime import datetime, timedelta
+from datetime import datetime
 from werkzeug.security import generate_password_hash, check_password_hash
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
@@ -68,7 +68,7 @@ def exportar_pdf(titulo, empresa, df):
     
     y = 710
     for _, row in df.iterrows():
-        linha = f"{row.get('cod','')} - {row.get('nome','')} ({row.get('grupo','')})"
+        linha = " | ".join([str(x) for x in row.values])
         p.drawString(50, y, linha[:100])
         y -= 20
         if y < 100:
@@ -142,17 +142,74 @@ else:
 
     if menu == "⚖️ Contabilidade":
         st.header("Relatórios de Balanço e DRE")
+
+        # --- Lançamentos Manuais ---
+        st.subheader("Novo Lançamento Contábil")
+        with st.form("novo_lancamento"):
+            data = st.date_input("Data do Lançamento")
+            contas = pd.read_sql_query("SELECT id, cod, nome FROM plano_contas WHERE empresa_id=?", db, params=(emp_id,))
+            conta_debito = st.selectbox("Conta Débito", contas['id'], format_func=lambda x: f"{contas.loc[contas['id']==x,'cod'].values[0]} - {contas.loc[contas['id']==x,'nome'].values[0]}")
+            conta_credito = st.selectbox("Conta Crédito", contas['id'], format_func=lambda x: f"{contas.loc[contas['id']==x,'cod'].values[0]} - {contas.loc[contas['id']==x,'nome'].values[0]}")
+            valor = st.number_input("Valor", min_value=0.01, step=0.01)
+            historico = st.text_area("Histórico")
+            if st.form_submit_button("Registrar"):
+                db.execute('INSERT INTO lancamentos (empresa_id, data, conta_debito_id, conta_credito_id, valor, historico) VALUES (?,?,?,?,?,?)',
+                           (emp_id, data.strftime("%Y-%m-%d"), conta_debito, conta_credito, valor, historico))
+                db.commit()
+                st.success("Lançamento registrado com sucesso!")
+                st.rerun()
+
+        # --- Relatório de Contas ---
         df_contas = pd.read_sql_query("SELECT cod, nome, grupo FROM plano_contas WHERE empresa_id=?", db, params=(emp_id,))
         st.dataframe(df_contas)
         st.download_button("📥 Baixar Relatório (PDF)", exportar_pdf("Relatório Contábil", emp_atual, df_contas), "relatorio.pdf")
 
-    elif menu == "🏛️ Fiscal":
+        # --- DRE ---
+        st.subheader("Demonstração do Resultado do Exercício (DRE)")
+        df_lanc = pd.read_sql_query("SELECT l.*, p.nome as conta_nome, p.grupo as conta_grupo FROM lancamentos l JOIN plano_contas p ON l.conta_debito_id=p.id WHERE l.empresa_id=?", db, params=(emp_id,))
+        receita = df_lanc[df_lanc['conta_grupo']=="Receita"]['valor'].sum()
+        custos = df_lanc[df_lanc['conta_grupo']=="Custo"]['valor'].sum()
+        despesas = df_lanc[df_lanc['conta_grupo']=="Despesa"]['valor'].sum()
+        resultado = receita - custos - despesas
+        st.metric("Receita", f"R$ {receita:,.2f}")
+        st.metric("Custos", f"R$ {custos:,.2f}")
+        st.metric("Despesas", f"R$ {despesas:,.2f}")
+        st.metric("Resultado Líquido", f"R$ {resultado:,.2f}")
+
+       elif menu == "🏛️ Fiscal":
         st.header("Apuração Fiscal (Faturamento 12 Meses)")
-        df_fat = pd.DataFrame({'Mês': ['09/25', '10/25', '11/25', '12/25', '01/26', '02/26'], 
-                               'Valor': [1000, 1500, 1200, 1800, 2000, 1700]})
+        df_fat = pd.DataFrame({
+            'Mês': ['09/25', '10/25', '11/25', '12/25', '01/26', '02/26'],
+            'Valor': [1000, 1500, 1200, 1800, 2000, 1700]
+        })
+
+        # Gráfico interativo
         fig = go.Figure([go.Bar(x=df_fat['Mês'], y=df_fat['Valor'])])
         st.plotly_chart(fig, use_container_width=True)
-        st.download_button("📥 Baixar Declaração", exportar_pdf("Declaração de Faturamento", emp_atual, df_fat), "faturamento.pdf")
+
+        # Apuração automática
+        total = df_fat['Valor'].sum()
+        st.metric("Total Faturado (6 meses)", f"R$ {total:,.2f}")
+
+        # Ajustes na apuração
+        st.subheader("Ajustes na Apuração")
+        ajuste_tipo = st.selectbox("Tipo de Ajuste", ["Adição", "Exclusão", "Compensação"])
+        ajuste_valor = st.number_input("Valor do Ajuste", min_value=0.0, step=0.01)
+        if st.button("Aplicar Ajuste"):
+            if ajuste_tipo == "Adição":
+                total += ajuste_valor
+            elif ajuste_tipo == "Exclusão":
+                total -= ajuste_valor
+            elif ajuste_tipo == "Compensação":
+                total -= ajuste_valor
+            st.success(f"Ajuste aplicado! Novo total: R$ {total:,.2f}")
+
+        # Exportação PDF
+        st.download_button(
+            "📥 Baixar Declaração",
+            exportar_pdf("Declaração de Faturamento", emp_atual, df_fat),
+            "faturamento.pdf"
+        )
 
     elif menu == "📥 Importação CSV":
         st.header("Importar via Planilha")
@@ -162,7 +219,9 @@ else:
             st.write("Dados detectados:", df.head())
             st.success("Dados prontos para processamento!")
 
+    # --- Logout ---
     if st.sidebar.button("Logout"):
         st.session_state.auth = False
         st.rerun()
+
     db.close()
