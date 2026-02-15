@@ -169,7 +169,7 @@ else:
                 fat = df_l[df_l['conta_credito'].str.contains("Receita")].groupby(df_l['data'].dt.strftime('%m/%Y'))['valor'].sum()
                 st.bar_chart(fat)
         else: st.info("Sem dados.")
-        
+
     # --- DASHBOARD ---
     elif menu == "📊 Dashboard":
         st.title(f"Painel de Controle - {emp_dict[emp_id]}")
@@ -195,6 +195,127 @@ else:
         else:
             st.info("Aguardando lançamentos para gerar gráficos.")
 
+    elif menu == "🏦 Fiscal":
+        with get_db() as conn:
+            empresa_atual = conn.execute("SELECT regime FROM empresas WHERE id = ?", (emp_id,)).fetchone()
+            regime = empresa_atual['regime']
+
+        st.header(f"Apuração Fiscal - {regime}")
+        
+        c1, c2 = st.columns(2)
+        mes_f = c1.selectbox("Mês", [f"{i:02d}" for i in range(1, 13)], key="fisc_m")
+        ano_f = c1.selectbox("Ano", ["2025", "2026"], key="fisc_a")
+        
+        data_ini, data_fim = f"{ano_f}-{mes_f}-01", f"{ano_f}-{mes_f}-31"
+
+        with get_db() as conn:
+            # Soma faturamento (Contas que começam com '4')
+            query = "SELECT sum(valor) FROM lancamentos WHERE empresa_id=? AND conta_credito LIKE '4%' AND data BETWEEN ? AND ?"
+            faturamento = conn.execute(query, (emp_id, data_ini, data_fim)).fetchone()[0] or 0
+
+        st.metric("Faturamento Bruto", f"R$ {faturamento:,.2f}")
+
+        imposto_total = 0
+        detalhes = {}
+
+        if regime == "MEI":
+            st.info("O MEI possui guia fixa (DAS).")
+            tipo_atv = st.radio("Atividade", ["Comércio/Indústria", "Serviços", "Ambos"], key="atv_mei")
+            # Valores de referência aproximados
+            imposto_total = 71.60 if tipo_atv == "Comércio/Indústria" else 75.60 if tipo_atv == "Serviços" else 76.60
+            detalhes = {"DAS MEI": imposto_total}
+
+        elif regime == "Simples Nacional":
+            aliq = st.number_input("Alíquota Efetiva (%)", value=6.0, step=0.1, key="sn_aliq_val")
+            imposto_total = faturamento * (aliq / 100)
+            detalhes = {"DAS Simples Nacional": imposto_total}
+
+        elif regime == "Lucro Presumido":
+            st.subheader("Cálculo de Impostos Federais")
+            tipo_lp = st.selectbox("Atividade", ["Serviços (32%)", "Comércio (8%)"], key="lp_tipo")
+            presuncao = 0.32 if "Serviços" in tipo_lp else 0.08
+            
+            # Alíquotas padrão Lucro Presumido
+            pis = faturamento * 0.0065
+            cofins = faturamento * 0.03
+            irpj = (faturamento * presuncao) * 0.15
+            csll = (faturamento * (0.32 if "Serviços" in tipo_lp else 0.12)) * 0.09
+            
+            imposto_total = pis + cofins + irpj + csll
+            detalhes = {"PIS": pis, "COFINS": cofins, "IRPJ": irpj, "CSLL": csll}
+
+        st.divider()
+        for imp, val in detalhes.items():
+            st.write(f"**{imp}:** R$ {val:,.2f}")
+        
+        st.subheader(f"Total de Impostos: R$ {imposto_total:,.2f}")
+
+        if st.button("Gerar Provisão de Impostos", type="primary", key="btn_prov_fisc"):
+            if is_periodo_fechado(emp_id, data_ini):
+                st.error("Período fechado! Não é possível lançar.")
+            elif imposto_total > 0:
+                with get_db() as conn:
+                    for imp, val in detalhes.items():
+                        conn.execute("""
+                            INSERT INTO lancamentos (empresa_id, data, conta_debito, conta_credito, valor, historico) 
+                            VALUES (?,?,?,?,?,?)
+                        """, (emp_id, data_fim, "5.01.04 - Provisão de Impostos", "2.01.03 - Impostos a Recolher", val, f"Provisão {imp} ref {mes_f}/{ano_f}"))
+                    conn.commit()
+                st.success("Impostos provisionados com sucesso!")
+    
+    elif menu == "📥 Importar":
+        st.header("Importação de Movimentações")
+        t_csv, t_ofx = st.tabs(["Arquivo CSV", "Extrato Bancário (OFX)"])
+
+        with t_csv:
+            st.write("Modelo de colunas: `data`, `conta_debito`, `conta_credito`, `valor`, `historico`")
+            file_csv = st.file_uploader("Selecione o CSV", type="csv", key="up_csv_f")
+            if file_csv:
+                df_csv = pd.read_csv(file_csv)
+                st.dataframe(df_csv.head())
+                if st.button("Processar Lançamentos CSV", key="btn_proc_csv"):
+                    with get_db() as conn:
+                        for _, r in df_csv.iterrows():
+                            if not is_periodo_fechado(emp_id, r['data']):
+                                conn.execute("INSERT INTO lancamentos (empresa_id, data, conta_debito, conta_credito, valor, historico) VALUES (?,?,?,?,?,?)", 
+                                           (emp_id, str(r['data']), r['conta_debito'], r['conta_credito'], float(r['valor']), r['historico']))
+                        conn.commit()
+                    st.success("Importação concluída!")
+
+        with t_ofx:
+            file_ofx = st.file_uploader("Selecione o arquivo OFX", type="ofx", key="up_ofx_f")
+            with get_db() as conn:
+                # Busca contas de banco para contrapartida
+                bancos = [f"{r['cod']} - {r['nome']}" for r in conn.execute("SELECT cod, nome FROM plano_contas WHERE empresa_id=? AND nome LIKE '%Banco%'", (emp_id,)).fetchall()]
+            
+            c_banco = st.selectbox("Selecione a conta Banco do Plano", bancos, key="sel_banco_ofx")
+            
+            if file_ofx and c_banco:
+                from ofxtools.Parser import OFXTree
+                parser = OFXTree()
+                parser.parse(file_ofx)
+                ofx = parser.convert()
+                
+                trans = []
+                for stmt in ofx.statements:
+                    for tr in stmt.banktranlist:
+                        trans.append({'data': tr.dtposted.date(), 'valor': float(tr.trnamt), 'memo': tr.memo or tr.name})
+                
+                df_ofx = pd.DataFrame(trans)
+                st.dataframe(df_ofx)
+                
+                if st.button("Lançar Extrato", key="btn_proc_ofx"):
+                    with get_db() as conn:
+                        for _, t in df_ofx.iterrows():
+                            if is_periodo_fechado(emp_id, t['data']): continue
+                            # Lógica de débito/crédito automática baseada no sinal do valor
+                            deb = c_banco if t['valor'] > 0 else "2.09.99 - A Classificar (Saídas)"
+                            crd = c_banco if t['valor'] < 0 else "1.09.99 - A Classificar (Entradas)"
+                            conn.execute("INSERT INTO lancamentos (empresa_id, data, conta_debito, conta_credito, valor, historico) VALUES (?,?,?,?,?,?)", 
+                                       (emp_id, str(t['data']), deb, crd, abs(t['valor']), t['memo']))
+                        conn.commit()
+                    st.success("Extrato processado com contas de classificação automática.")
+                    
     # --- GERENCIAR ---
     elif menu == "⚙️ Gerenciar":
         st.header("Histórico e Manutenção de Dados")
