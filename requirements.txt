@@ -4,3 +4,5 @@ plotly
 reportlab
 ofxtools
 werkzeug
+FPDF
+
