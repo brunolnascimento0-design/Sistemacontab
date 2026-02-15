@@ -2,9 +2,10 @@ import streamlit as st
 import sqlite3
 import pandas as pd
 import io
+from fpdf import FPDF
 from werkzeug.security import generate_password_hash, check_password_hash
 
-# --- 1. CONFIGURAÇÃO E BANCO DE DADOS ---
+# --- 1. CONFIGURAÇÃO E FUNÇÕES AUXILIARES ---
 st.set_page_config(page_title="SysContábil SaaS", layout="wide", page_icon="⚖️")
 DB_NAME = "syscontabil_v5.db"
 
@@ -24,7 +25,7 @@ def init_db():
         conn.commit()
 
 def is_periodo_fechado(emp_id, data_str):
-    mes_ano = str(data_str)[:7]
+    mes_ano = str(data_str)[:7] # YYYY-MM
     with get_db() as conn:
         res = conn.execute("SELECT 1 FROM fechamentos WHERE empresa_id=? AND mes_ano=?", (emp_id, mes_ano)).fetchone()
     return True if res else False
@@ -41,6 +42,23 @@ def importar_plano_padrao(emp_id):
         conn.executemany("INSERT INTO plano_contas (empresa_id, cod, nome, grupo) VALUES (?, ?, ?, ?)", 
                        [(emp_id, c, n, g) for c, n, g in plano])
         conn.commit()
+
+def gerar_pdf(df, titulo):
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", 'B', 16)
+    pdf.cell(190, 10, titulo, ln=True, align='C')
+    pdf.ln(10)
+    pdf.set_font("Arial", 'B', 10)
+    for col in df.columns:
+        pdf.cell(40, 10, str(col), 1)
+    pdf.ln()
+    pdf.set_font("Arial", '', 10)
+    for _, row in df.iterrows():
+        for val in row:
+            pdf.cell(40, 10, str(val), 1)
+        pdf.ln()
+    return pdf.output(dest='S').encode('latin-1')
 
 init_db()
 
@@ -74,9 +92,10 @@ else:
     
     if not empresas:
         with st.form("nova_emp"):
-            n, c = st.text_input("Razão Social"), st.text_input("CNPJ")
-            r = st.selectbox("Regime", ["Simples Nacional", "Lucro Presumido", "MEI"])
-            if st.form_submit_button("Cadastrar"):
+            st.subheader("Cadastrar Empresa")
+            n, c = st.text_input("Razão Social", key="en"), st.text_input("CNPJ", key="ec")
+            r = st.selectbox("Regime", ["Simples Nacional", "Lucro Presumido", "MEI"], key="er")
+            if st.form_submit_button("Criar"):
                 with get_db() as conn:
                     conn.execute('INSERT INTO empresas (nome, cnpj, regime, usuario_id) VALUES (?,?,?,?)', (n, c, r, st.session_state.user_id))
                     conn.commit(); st.rerun()
@@ -84,86 +103,73 @@ else:
 
     emp_dict = {e['id']: e['nome'] for e in empresas}
     emp_regime = {e['id']: e['regime'] for e in empresas}
-    emp_id = st.sidebar.selectbox("Empresa", options=list(emp_dict.keys()), format_func=lambda x: emp_dict[x])
-    menu = st.sidebar.radio("Menu", ["📊 Dashboard", "⚖️ Contabilidade", "🏦 Fiscal", "📥 Importar", "⚙️ Gerenciar", "🔒 Fechamento"])
+    emp_id = st.sidebar.selectbox("Empresa Ativa", options=list(emp_dict.keys()), format_func=lambda x: emp_dict[x])
+    menu = st.sidebar.radio("Menu", ["📊 Dashboard", "⚖️ Contabilidade", "🏦 Fiscal", "📥 Importar", "📄 Relatórios", "⚙️ Gerenciar", "🔒 Fechamento"])
 
     if st.sidebar.button("Sair"):
         st.session_state.auth = False; st.rerun()
 
-    # --- MÓDULO IMPORTAR (CSV E OFX) ---
-    if menu == "📥 Importar":
-        st.header("Importação de Dados")
-        t_csv, t_ofx = st.tabs(["Lançamentos CSV", "Extrato OFX"])
-        
-        with t_csv:
-            up_csv = st.file_uploader("Arquivo CSV", type="csv")
-            if up_csv:
-                df = pd.read_csv(up_csv)
-                st.dataframe(df.head())
-                if st.button("Importar CSV"):
-                    with get_db() as conn:
-                        for _, r in df.iterrows():
-                            if not is_periodo_fechado(emp_id, r['data']):
-                                conn.execute("INSERT INTO lancamentos (empresa_id, data, conta_debito, conta_credito, valor, historico) VALUES (?,?,?,?,?,?)", (emp_id, str(r['data']), r['conta_debito'], r['conta_credito'], r['valor'], r['historico']))
-                        conn.commit()
-                    st.success("Importado!")
-
-        with t_ofx:
-            up_ofx = st.file_uploader("Arquivo OFX", type="ofx")
-            with get_db() as conn:
-                contas_b = [f"{r['cod']} - {r['nome']}" for r in conn.execute("SELECT cod, nome FROM plano_contas WHERE empresa_id=? AND nome LIKE '%Banco%'", (emp_id,)).fetchall()]
-            
-            banco_dest = st.selectbox("Conta Banco Destino", contas_b)
-            if up_ofx and banco_dest:
-                from ofxtools.Parser import OFXTree
-                parser = OFXTree()
-                parser.parse(up_ofx)
-                ofx = parser.convert()
-                
-                trans = []
-                for stmt in ofx.statements:
-                    for tr in stmt.banktranlist:
-                        trans.append({'data': tr.dtposted.date(), 'valor': float(tr.trnamt), 'hist': tr.memo or tr.name})
-                
-                df_o = pd.DataFrame(trans)
-                st.dataframe(df_o)
-                if st.button("Processar OFX"):
-                    with get_db() as conn:
-                        for _, t in df_o.iterrows():
-                            if is_periodo_fechado(emp_id, t['data']): continue
-                            deb = banco_dest if t['valor'] > 0 else "2.09.99 - A Classificar (Saídas)"
-                            crd = banco_dest if t['valor'] < 0 else "1.09.99 - A Classificar (Entradas)"
-                            conn.execute("INSERT INTO lancamentos (empresa_id, data, conta_debito, conta_credito, valor, historico) VALUES (?,?,?,?,?,?)", (emp_id, str(t['data']), deb, crd, abs(t['valor']), t['hist']))
-                        conn.commit()
-                    st.success("Extrato Importado!")
-
-    # --- MÓDULO FISCAL ---
-    elif menu == "🏦 Fiscal":
-        regime = emp_regime[emp_id]
-        st.header(f"Apuração - {regime}")
-        m, a = st.selectbox("Mês", [f"{i:02d}" for i in range(1,13)]), st.selectbox("Ano", ["2025", "2026"])
-        d_ini, d_fim = f"{a}-{m}-01", f"{a}-{m}-31"
-        
-        with get_db() as conn:
-            fat = conn.execute("SELECT sum(valor) FROM lancamentos WHERE empresa_id=? AND conta_credito LIKE '4%' AND data BETWEEN ? AND ?", (emp_id, d_ini, d_fim)).fetchone()[0] or 0
-        
-        st.metric("Faturamento", f"R$ {fat:,.2f}")
-        # Lógica de cálculo (Simples, MEI, Presumido) já integrada conforme conversas anteriores...
-        # [Espaço para as fórmulas de cálculo específicas de cada regime]
-        st.info("Utilize as fórmulas de cálculo conforme o regime selecionado no cadastro da empresa.")
-
     # --- MÓDULO CONTABILIDADE ---
-    elif menu == "⚖️ Contabilidade":
-        tab_p, tab_l = st.tabs(["Plano de Contas", "Lançamentos"])
-        with tab_p:
+    if menu == "⚖️ Contabilidade":
+        tp, tl = st.tabs(["Plano de Contas", "Lançamentos Manuais"])
+        with tp:
             with get_db() as conn:
                 if conn.execute("SELECT count(*) FROM plano_contas WHERE empresa_id=?", (emp_id,)).fetchone()[0] == 0:
-                    if st.button("Importar Plano Padrão"): importar_plano_padrao(emp_id); st.rerun()
-            # Visualização e Adição Manual...
+                    if st.button("⚡ Importar Plano Padrão"): importar_plano_padrao(emp_id); st.rerun()
             with get_db() as conn:
                 df_p = pd.read_sql_query("SELECT cod, nome, grupo FROM plano_contas WHERE empresa_id=?", conn, params=(emp_id,))
                 st.dataframe(df_p, use_container_width=True)
+        with tl:
+            st.subheader("Nova Partida Dobrada")
+            with get_db() as conn:
+                contas = [f"{r['cod']} - {r['nome']}" for r in conn.execute("SELECT cod, nome FROM plano_contas WHERE empresa_id=?", (emp_id,)).fetchall()]
+            if contas:
+                with st.form("f_lanc_man"):
+                    col1, col2 = st.columns(2)
+                    d, v = col1.date_input("Data"), col2.number_input("Valor R$", min_value=0.01)
+                    deb, crd = st.selectbox("Conta Débito", contas, key="d_man"), st.selectbox("Conta Crédito", contas, key="c_man")
+                    h = st.text_area("Histórico")
+                    if st.form_submit_button("Lançar"):
+                        if is_periodo_fechado(emp_id, d): st.error("Período Fechado!")
+                        elif deb == crd: st.error("Contas iguais!")
+                        else:
+                            with get_db() as conn:
+                                conn.execute("INSERT INTO lancamentos (empresa_id, data, conta_debito, conta_credito, valor, historico) VALUES (?,?,?,?,?,?)", (emp_id, str(d), deb, crd, v, h))
+                                conn.commit(); st.success("OK!"); st.rerun()
 
+    # --- MÓDULO RELATÓRIOS ---
+    elif menu == "📄 Relatórios":
+        st.header("Relatórios Contábeis")
+        t_dre, t_bp, t_fat, t_fisc = st.tabs(["DRE", "Balanço Patrimonial", "Faturamento 12m", "Espelho Fiscal"])
+        with get_db() as conn:
+            df_l = pd.read_sql_query("SELECT * FROM lancamentos WHERE empresa_id=?", conn, params=(emp_id,))
+            df_p = pd.read_sql_query("SELECT * FROM plano_contas WHERE empresa_id=?", conn, params=(emp_id,))
+        
+        if not df_l.empty:
+            saldos = []
+            for _, c in df_p.iterrows():
+                label = f"{c['cod']} - {c['nome']}"
+                deb = df_l[df_l['conta_debito'] == label]['valor'].sum()
+                crd = df_l[df_l['conta_credito'] == label]['valor'].sum()
+                res = (deb - crd) if c['grupo'] in ['Ativo', 'Despesa'] else (crd - deb)
+                saldos.append({'Conta': c['nome'], 'Grupo': c['grupo'], 'Saldo': res})
+            df_s = pd.DataFrame(saldos)
+
+            with t_dre:
+                dre = df_s[df_s['Grupo'].isin(['Receita', 'Despesa'])]
+                st.table(dre)
+                if st.button("PDF DRE"): st.download_button("Baixar PDF", gerar_pdf(dre, "DRE"), "dre.pdf")
+            with t_bp:
+                st.write("**Ativo**")
+                st.table(df_s[df_s['Grupo'] == 'Ativo'])
+                st.write("**Passivo/PL**")
+                st.table(df_s[df_s['Grupo'].isin(['Passivo', 'Patrimônio Líquido'])])
+            with t_fat:
+                df_l['data'] = pd.to_datetime(df_l['data'])
+                fat = df_l[df_l['conta_credito'].str.contains("Receita")].groupby(df_l['data'].dt.strftime('%m/%Y'))['valor'].sum()
+                st.bar_chart(fat)
+        else: st.info("Sem dados.")
+        
     # --- DASHBOARD ---
     elif menu == "📊 Dashboard":
         st.title(f"Painel de Controle - {emp_dict[emp_id]}")
